@@ -107,11 +107,11 @@ extern volatile uint32_t buzzerTimer;
 volatile uint32_t main_loop_counter;
 int16_t batVoltageCalib;         // global variable for calibrated battery voltage
 int16_t board_temp_deg_c;        // global variable for calibrated temperature in degrees Celsius
-int16_t left_dc_curr;            // global variable for Left DC Link current 
+int16_t left_dc_curr;            // global variable for Left DC Link current
 int16_t right_dc_curr;           // global variable for Right DC Link current
-int16_t dc_curr;                 // global variable for Total DC Link current 
-int16_t cmdL;                    // global variable for Left Command 
-int16_t cmdR;                    // global variable for Right Command 
+int16_t dc_curr;                 // global variable for Total DC Link current
+int16_t cmdL;                    // global variable for Left Command
+int16_t cmdR;                    // global variable for Right Command
 
 //------------------------------------------------------------------------
 // Local variables
@@ -139,12 +139,12 @@ static uint8_t sideboard_leds_R;
 
 #ifdef VARIANT_TRANSPOTTER
   uint8_t  nunchuk_connected;
-  extern float    setDistance;  
+  extern float    setDistance;
 
   static uint8_t  checkRemote = 0;
   static uint16_t distance;
   static float    steering;
-  static int      distanceErr;  
+  static int      distanceErr;
   static int      lastDistance = 0;
   static uint16_t transpotter_counter = 0;
 #endif
@@ -209,7 +209,7 @@ int main(void) {
 
   poweronMelody();
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
-  
+
   int32_t board_temp_adcFixdt = adc_buffer.temp << 16;  // Fixed-point filter output initialized with current ADC converted to fixed-point
   int16_t board_temp_adcFilt  = adc_buffer.temp;
 
@@ -248,15 +248,137 @@ int main(void) {
     }
   #endif
 
+
+  // One Wheel PID Control Variables
+  float elapsedTime, time, timePrev;
+  float PID, error, previous_error = 0;  // Initialize previous_error to avoid garbage on first iteration
+  float pid_p=0;
+  float pid_i=0;
+  float pid_d=0;
+  float kp=30.0f;                         // Scale: 30 * 25° = 750 (reasonable motor command)
+  float ki=0.01f;                         // Very small - integral accumulation is dangerous
+  float kd=2.0f;                          // Moderate derivative damping
+  float desired_angle = 0;                // TARGET ANGLE
+  int mspeed = 0;
+  const float MIN_ELAPSED_TIME = 0.001f;  // Prevent division by zero or extreme values (1 ms minimum)
+  const float DEADZONE = 3.0f;            // Deadzone: ignore errors smaller than ±3 degrees
+  const float MAX_INTEGRAL = 200.0f;      // Anti-windup: cap integral term
+  // #define ONEWHEEL_TEST_MODE           // Uncomment to test motor movement regardless of pitch angle
+
+  time = HAL_GetTick();
+
   while(1) {
     if (buzzerTimer - buzzerTimer_prev > 16*DELAY_IN_MAIN_LOOP) {   // 1 ms = 16 ticks buzzerTimer
 
     readCommand();                        // Read Command: input1[inIdx].cmd, input2[inIdx].cmd
     calcAvgSpeed();                       // Calculate average measured speed: speedAvg, speedAvgAbs
 
+    #ifdef VARIANT_ONEWHEEL
+      timePrev = time;
+      time = HAL_GetTick();
+      elapsedTime = (time - timePrev) / 1000.0f;
+      // Guard against zero or very small elapsed time to avoid extreme derivative values
+      if (elapsedTime < MIN_ELAPSED_TIME) {
+        elapsedTime = MIN_ELAPSED_TIME;
+      }
+
+      // SIDEBOARD_L.PITCH IS THE PITCH ANGLE WHICH WE NEED
+      error = Sideboard_L.pitch - desired_angle; // ERROR CALCULATION
+
+      // Apply deadzone to prevent constant corrections on level surface
+      if (fabsf(error) < DEADZONE) {
+        error = 0;  // Treat small errors as zero
+        pid_i = 0;  // Reset integral when in deadzone
+      }
+
+      // PROPORTIONAL ERROR
+      pid_p = kp * error;
+
+      // INTEGRAL ERROR with anti-windup (cap accumulation)
+      pid_i = pid_i + (ki * error * elapsedTime);         // Multiply by elapsedTime for proper integration
+      if (pid_i > MAX_INTEGRAL) pid_i = MAX_INTEGRAL;     // Anti-windup upper limit
+      if (pid_i < -MAX_INTEGRAL) pid_i = -MAX_INTEGRAL;   // Anti-windup lower limit
+
+      // DERIVATIVE ERROR (derivative damping only, not error rate)
+      pid_d = kd * (previous_error - error) / elapsedTime;  // Use previous_error for smoothing
+
+      // TOTAL PID VALUE
+      PID = pid_p + pid_i + pid_d;
+
+      // UPDATING THE ERROR VALUE
+      previous_error = error;
+
+      #ifdef ONEWHEEL_TEST_MODE
+        mspeed = 60;
+      #else
+        // Convert PID to motor speed (absolute value)
+        mspeed = abs((int)fabsf(PID));
+
+        // Clamp to safe range [-1000, 1000]
+        if (mspeed > 1000) mspeed = 1000;
+
+        // Minimum speed for movement only if error is significant
+        // if (mspeed < 50) mspeed = 50;
+      #endif
+
+      // MOTOR CONTROL: Only move if sensor is pressed
+      if ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) {
+        if (Sideboard_L.pitch < -DEADZONE) {  // Tilted backward: move forward
+          rtP_Left.b_cruiseCtrlEna  = 0;
+          rtP_Right.b_cruiseCtrlEna = 0;
+          cmdL = mspeed;
+          cmdR = mspeed;
+        }
+        else if (Sideboard_L.pitch > DEADZONE) {  // Tilted forward: move backward
+          rtP_Left.b_cruiseCtrlEna  = 0;
+          rtP_Right.b_cruiseCtrlEna = 0;
+          cmdL = -mspeed;
+          cmdR = -mspeed;
+        }
+        else {  // Level: stop motors
+          cmdL = 0;
+          cmdR = 0;
+          standstillHold();
+        }
+      } else {
+        // No sensor pressed: stop motors
+        cmdL = 0;
+        cmdR = 0;
+        mspeed = 0;
+      }
+
+      if(Sideboard_L.pitch > 45)
+        standstillHold();
+      if(Sideboard_L.pitch < -45)
+        standstillHold();
+
+      if (main_loop_counter % 100 == 0) {
+        // DEBUG: Check if sideboard data is being received
+        printf("SIDEBOARD_L DEBUG: pitch=%d, dPitch=%d, cmd1=%d, cmd2=%d, sensors=%u, start=0x%04x, checksum=0x%04x\r\n",
+               Sideboard_L.pitch, Sideboard_L.dPitch, Sideboard_L.cmd1, Sideboard_L.cmd2, Sideboard_L.sensors,
+               Sideboard_L.start, Sideboard_L.checksum);
+        // Debug: Hoverboard Calculation Output (uncomment if needed)
+        printf("Hoverboard DEBUG: main pitch: %d, deadzone: %d, error: %d, PID_total: %d, mspeed: %d, enable: %d, speedAvgAbs: %d, sensor_activated: %d, cmdL:%i, cmdR:%i, BatADC:%i, BatV:%i, TempADC:%i, Temp:%i \r\n",
+              Sideboard_L.pitch,
+              (int)DEADZONE,
+              (int)error,
+              (int)PID,
+              mspeed,
+              enable,
+              speedAvgAbs,
+              ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) ? 1 : 0,
+              cmdL,                     // 3: output command: [-1000, 1000]
+              cmdR,                     // 4: output command: [-1000, 1000]
+              adc_buffer.batt1,         // 5: for battery voltage calibration
+              batVoltageCalib,          // 6: for verifying battery voltage calibration
+              board_temp_adcFilt,       // 7: for board temperature calibration
+              board_temp_deg_c);        // 8: for verifying board temperature calibration;
+      }
+    #endif
+
     #ifndef VARIANT_TRANSPOTTER
-      // ####### MOTOR ENABLING: Only if the initial input is very small (for SAFETY) #######
-      if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode && 
+      // For other variants, motors enable only if inputs are small (safety)
+      if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode &&
           ABS(input1[inIdx].cmd) < 50 && ABS(input2[inIdx].cmd) < 50){
         beepShort(6);                     // make 2 beeps indicating the motor enable
         beepShort(4); HAL_Delay(100);
@@ -274,7 +396,9 @@ int main(void) {
       #endif
 
       #ifdef STANDSTILL_HOLD_ENABLE
-        standstillHold();                                           // Apply Standstill Hold functionality. Only available and makes sense for VOLTAGE or TORQUE Mode
+        #ifndef VARIANT_ONEWHEEL
+          standstillHold();                                           // Apply Standstill Hold functionality. Only available and makes sense for VOLTAGE or TORQUE mode.
+        #endif
       #endif
 
       #ifdef VARIANT_HOVERCAR
@@ -296,7 +420,7 @@ int main(void) {
 
       #ifdef VARIANT_HOVERCAR
       if (inIdx == CONTROL_ADC) {                                   // Only use use implementation below if pedals are in use (ADC input)
-        if (speedAvg > 0) {                                         // Make sure the Brake pedal is opposite to the direction of motion AND it goes to 0 as we reach standstill (to avoid Reverse driving by Brake pedal) 
+        if (speedAvg > 0) {                                         // Make sure the Brake pedal is opposite to the direction of motion AND it goes to 0 as we reach standstill (to avoid Reverse driving by Brake pedal)
           input1[inIdx].cmd = (int16_t)((-input1[inIdx].cmd * speedBlend) >> 15);
         } else {
           input1[inIdx].cmd = (int16_t)(( input1[inIdx].cmd * speedBlend) >> 15);
@@ -305,7 +429,7 @@ int main(void) {
       #endif
 
       #ifdef VARIANT_SKATEBOARD
-        if (input2[inIdx].cmd < 0) {                                // When Throttle is negative, it acts as brake. This condition is to make sure it goes to 0 as we reach standstill (to avoid Reverse driving) 
+        if (input2[inIdx].cmd < 0) {                                // When Throttle is negative, it acts as brake. This condition is to make sure it goes to 0 as we reach standstill (to avoid Reverse driving)
           if (speedAvg > 0) {                                       // Make sure the braking is opposite to the direction of motion
             input2[inIdx].cmd  = (int16_t)(( input2[inIdx].cmd * speedBlend) >> 15);
           } else {
@@ -341,13 +465,13 @@ int main(void) {
       }
       #endif
 
-      #if defined(TANK_STEERING) && !defined(VARIANT_HOVERCAR) && !defined(VARIANT_SKATEBOARD) 
+      #if defined(TANK_STEERING) && !defined(VARIANT_HOVERCAR) && !defined(VARIANT_SKATEBOARD)
         // Tank steering (no mixing)
-        cmdL = steer; 
+        cmdL = steer;
         cmdR = speed;
-      #else 
+      #else
         // ####### MIXER #######
-        mixerFcn(speed << 4, steer << 4, &cmdR, &cmdL);   // This function implements the equations above
+        // mixerFcn(speed << 4, steer << 4, &cmdR, &cmdL);   // This function implements the equations above
       #endif
 
 
@@ -439,7 +563,7 @@ int main(void) {
               nunchuk_connected = 0;
 	    }
           }
-        }   
+        }
       #endif
 
       #ifdef SUPPORT_LCD
@@ -472,7 +596,7 @@ int main(void) {
     #if defined(FEEDBACK_SERIAL_USART3)
       sideboardLeds(&sideboard_leds_R);
     #endif
-    
+
 
     // ####### CALC BOARD TEMPERATURE #######
     filtLowPass32(adc_buffer.temp, TEMP_FILT_COEF, &board_temp_adcFixdt);
@@ -483,25 +607,25 @@ int main(void) {
     batVoltageCalib = batVoltage * BAT_CALIB_REAL_VOLTAGE / BAT_CALIB_ADC;
 
     // ####### CALC DC LINK CURRENT #######
-    left_dc_curr  = -(rtU_Left.i_DCLink * 100) / A2BIT_CONV;   // Left DC Link Current * 100 
+    left_dc_curr  = -(rtU_Left.i_DCLink * 100) / A2BIT_CONV;   // Left DC Link Current * 100
     right_dc_curr = -(rtU_Right.i_DCLink * 100) / A2BIT_CONV;  // Right DC Link Current * 100
     dc_curr       = left_dc_curr + right_dc_curr;            // Total DC Link Current * 100
 
     // ####### DEBUG SERIAL OUT #######
     #if defined(DEBUG_SERIAL_USART2) || defined(DEBUG_SERIAL_USART3)
-      if (main_loop_counter % 25 == 0) {    // Send data periodically every 125 ms      
+      if (main_loop_counter % 25 == 0) {    // Send data periodically every 125 ms
         #if defined(DEBUG_SERIAL_PROTOCOL)
           process_debug();
         #else
-          printf("in1:%i in2:%i cmdL:%i cmdR:%i BatADC:%i BatV:%i TempADC:%i Temp:%i \r\n",
-            input1[inIdx].raw,        // 1: INPUT1
-            input2[inIdx].raw,        // 2: INPUT2
-            cmdL,                     // 3: output command: [-1000, 1000]
-            cmdR,                     // 4: output command: [-1000, 1000]
-            adc_buffer.batt1,         // 5: for battery voltage calibration
-            batVoltageCalib,          // 6: for verifying battery voltage calibration
-            board_temp_adcFilt,       // 7: for board temperature calibration
-            board_temp_deg_c);        // 8: for verifying board temperature calibration
+          // printf("in1:%i in2:%i cmdL:%i cmdR:%i BatADC:%i BatV:%i TempADC:%i Temp:%i \r\n",
+          //   input1[inIdx].raw,        // 1: INPUT1
+          //   input2[inIdx].raw,        // 2: INPUT2
+          //   cmdL,                     // 3: output command: [-1000, 1000]
+          //   cmdR,                     // 4: output command: [-1000, 1000]
+          //   adc_buffer.batt1,         // 5: for battery voltage calibration
+          //   batVoltageCalib,          // 6: for verifying battery voltage calibration
+          //   board_temp_adcFilt,       // 7: for board temperature calibration
+          //   board_temp_deg_c);        // 8: for verifying board temperature calibration
         #endif
       }
     #endif
@@ -520,7 +644,7 @@ int main(void) {
         #if defined(FEEDBACK_SERIAL_USART2)
           if(__HAL_DMA_GET_COUNTER(huart2.hdmatx) == 0) {
             Feedback.cmdLed     = (uint16_t)sideboard_leds_L;
-            Feedback.checksum   = (uint16_t)(Feedback.start ^ Feedback.cmd1 ^ Feedback.cmd2 ^ Feedback.speedR_meas ^ Feedback.speedL_meas 
+            Feedback.checksum   = (uint16_t)(Feedback.start ^ Feedback.cmd1 ^ Feedback.cmd2 ^ Feedback.speedR_meas ^ Feedback.speedL_meas
                                            ^ Feedback.batVoltage ^ Feedback.boardTemp ^ Feedback.cmdLed);
 
             HAL_UART_Transmit_DMA(&huart2, (uint8_t *)&Feedback, sizeof(Feedback));
@@ -529,7 +653,7 @@ int main(void) {
         #if defined(FEEDBACK_SERIAL_USART3)
           if(__HAL_DMA_GET_COUNTER(huart3.hdmatx) == 0) {
             Feedback.cmdLed     = (uint16_t)sideboard_leds_R;
-            Feedback.checksum   = (uint16_t)(Feedback.start ^ Feedback.cmd1 ^ Feedback.cmd2 ^ Feedback.speedR_meas ^ Feedback.speedL_meas 
+            Feedback.checksum   = (uint16_t)(Feedback.start ^ Feedback.cmd1 ^ Feedback.cmd2 ^ Feedback.speedR_meas ^ Feedback.speedL_meas
                                            ^ Feedback.batVoltage ^ Feedback.boardTemp ^ Feedback.cmdLed);
 
             HAL_UART_Transmit_DMA(&huart3, (uint8_t *)&Feedback, sizeof(Feedback));
@@ -584,7 +708,7 @@ int main(void) {
     }
 
     #if defined(CRUISE_CONTROL_SUPPORT) || defined(STANDSTILL_HOLD_ENABLE)
-      if ((abs(rtP_Left.n_cruiseMotTgt)  > 50 && rtP_Left.b_cruiseCtrlEna) || 
+      if ((abs(rtP_Left.n_cruiseMotTgt)  > 50 && rtP_Left.b_cruiseCtrlEna) ||
           (abs(rtP_Right.n_cruiseMotTgt) > 50 && rtP_Right.b_cruiseCtrlEna)) {
         inactivity_timeout_counter = 0;
       }
