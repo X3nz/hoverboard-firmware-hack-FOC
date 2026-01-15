@@ -343,15 +343,21 @@ int main(void) {
           cmdR = -mspeed;
         }
         else {  // Level: stop motors
-          cmdL = 0;
-          cmdR = 0;
-          standstillHold();
+          if (speedAvgAbs > 100) {  // Only brake if actually moving
+            cmdL = -20;  // Small negative command for regen braking
+            cmdR = -20;
+          } else {
+            cmdL = 0;
+            cmdR = 0;
+            standstillHold();
+          }
         }
       } else {
         // No sensor pressed: stop motors
         cmdL = 0;
         cmdR = 0;
         mspeed = 0;
+        standstillHold();
       }
 
       if(Sideboard_L.pitch > 45)
