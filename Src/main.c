@@ -289,6 +289,18 @@ int main(void) {
         elapsedTime = MIN_ELAPSED_TIME;
       }
 
+      // Enable motors if currently disabled and no error condition exists
+      if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode &&
+          ABS(input1[inIdx].cmd) < 50 && ABS(input2[inIdx].cmd) < 50) {
+        beepShort(6);                     // make 2 beeps indicating the motor enable
+        beepShort(4); HAL_Delay(100);
+        steerFixdt = speedFixdt = 0;      // reset filters
+        enable = 1;                       // enable motors
+        #if defined(DEBUG_SERIAL_USART2) || defined(DEBUG_SERIAL_USART3)
+        printf("-- Motors enabled --\r\n");
+        #endif
+      }
+
       // SIDEBOARD_L.PITCH IS THE PITCH ANGLE WHICH WE NEED
       error = Sideboard_L.pitch - desired_angle; // ERROR CALCULATION
 
@@ -403,8 +415,8 @@ int main(void) {
               ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) ? 1 : 0,
               cmdL,                     // 3: output command: [-1000, 1000]
               cmdR,                     // 4: output command: [-1000, 1000]
-              cmdL_ratelimit,
-              cmdR_ratelimit,
+              (float)cmdL_ratelimit / 16.0f,
+              (float)cmdR_ratelimit / 16.0f,
               adc_buffer.batt1,         // 5: for battery voltage calibration
               batVoltageCalib,          // 6: for verifying battery voltage calibration
               board_temp_adcFilt,       // 7: for board temperature calibration
@@ -655,15 +667,15 @@ int main(void) {
         #if defined(DEBUG_SERIAL_PROTOCOL)
           process_debug();
         #else
-          printf("in1:%i in2:%i cmdL:%i cmdR:%i BatADC:%i BatV:%i TempADC:%i Temp:%i \r\n",
-            input1[inIdx].raw,        // 1: INPUT1
-            input2[inIdx].raw,        // 2: INPUT2
-            cmdL,                     // 3: output command: [-1000, 1000]
-            cmdR,                     // 4: output command: [-1000, 1000]
-            adc_buffer.batt1,         // 5: for battery voltage calibration
-            batVoltageCalib,          // 6: for verifying battery voltage calibration
-            board_temp_adcFilt,       // 7: for board temperature calibration
-            board_temp_deg_c);        // 8: for verifying board temperature calibration
+          // printf("in1:%i in2:%i cmdL:%i cmdR:%i BatADC:%i BatV:%i TempADC:%i Temp:%i \r\n",
+          //   input1[inIdx].raw,        // 1: INPUT1
+          //   input2[inIdx].raw,        // 2: INPUT2
+          //   cmdL,                     // 3: output command: [-1000, 1000]
+          //   cmdR,                     // 4: output command: [-1000, 1000]
+          //   adc_buffer.batt1,         // 5: for battery voltage calibration
+          //   batVoltageCalib,          // 6: for verifying battery voltage calibration
+          //   board_temp_adcFilt,       // 7: for board temperature calibration
+          //   board_temp_deg_c);        // 8: for verifying board temperature calibration
         #endif
       }
     #endif
