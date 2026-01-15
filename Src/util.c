@@ -198,6 +198,8 @@ static uint8_t brakePressed;
 #if defined(CRUISE_CONTROL_SUPPORT) || (defined(STANDSTILL_HOLD_ENABLE) && (CTRL_TYP_SEL == FOC_CTRL) && (CTRL_MOD_REQ != SPD_MODE))
 static uint8_t cruiseCtrlAcv = 0;
 static uint8_t standstillAcv = 0;
+static uint8_t standstillAcvL = 0;
+static uint8_t standstillAcvR = 0;
 #endif
 
 /* =========================== Retargeting printf =========================== */
@@ -685,6 +687,60 @@ void standstillHold(void) {
         rtP_Left.b_cruiseCtrlEna  = 0;
         rtP_Right.b_cruiseCtrlEna = 0;
         standstillAcv = 0;
+      }
+    }
+  #endif
+}
+
+ /*
+ * Standstill Hold Function
+ * This function uses Cruise Control to provide an anti-roll functionality at standstill.
+ * Only available and makes sense for FOC VOLTAGE or FOC TORQUE mode.
+ * 
+ * Input:  none
+ * Output: standstillAcv
+ */
+void standstillHoldL(void) {
+  #if defined(STANDSTILL_HOLD_ENABLE) && (CTRL_TYP_SEL == FOC_CTRL) && (CTRL_MOD_REQ != SPD_MODE)
+    if (!rtP_Left.b_cruiseCtrlEna) {                                  // If Stanstill in NOT Active -> try Activation
+      if (((input1[inIdx].cmd > 50 || input2[inIdx].cmd < -50) && speedAvgAbs < 30) // Check if Brake is pressed AND measured speed is small
+          || (input2[inIdx].cmd < 20 && speedAvgAbs < 5)) {           // OR Throttle is small AND measured speed is very small
+        rtP_Left.n_cruiseMotTgt   = 0;
+        rtP_Left.b_cruiseCtrlEna  = 1;
+        standstillAcvL = 1;
+      } 
+    }
+    else {                                                            // If Stanstill is Active -> try Deactivation
+      if (input1[inIdx].cmd < 20 && input2[inIdx].cmd > 50 && !cruiseCtrlAcv) { // Check if Brake is released AND Throttle is pressed AND no Cruise Control
+        rtP_Left.b_cruiseCtrlEna  = 0;
+        standstillAcvL = 0;
+      }
+    }
+  #endif
+}
+
+ /*
+ * Standstill Hold Function
+ * This function uses Cruise Control to provide an anti-roll functionality at standstill.
+ * Only available and makes sense for FOC VOLTAGE or FOC TORQUE mode.
+ * 
+ * Input:  none
+ * Output: standstillAcvR
+ */
+void standstillHoldR(void) {
+  #if defined(STANDSTILL_HOLD_ENABLE) && (CTRL_TYP_SEL == FOC_CTRL) && (CTRL_MOD_REQ != SPD_MODE)
+    if (!rtP_Right.b_cruiseCtrlEna) {                                  // If Stanstill in NOT Active -> try Activation
+      if (((input1[inIdx].cmd > 50 || input2[inIdx].cmd < -50) && speedAvgAbs < 30) // Check if Brake is pressed AND measured speed is small
+          || (input2[inIdx].cmd < 20 && speedAvgAbs < 5)) {           // OR Throttle is small AND measured speed is very small
+        rtP_Right.n_cruiseMotTgt  = 0;
+        rtP_Right.b_cruiseCtrlEna = 1;
+        standstillAcvR = 1;
+      } 
+    }
+    else {                                                            // If Stanstill is Active -> try Deactivation
+      if (input1[inIdx].cmd < 20 && input2[inIdx].cmd > 50 && !cruiseCtrlAcv) { // Check if Brake is released AND Throttle is pressed AND no Cruise Control
+        rtP_Right.b_cruiseCtrlEna = 0;
+        standstillAcvR = 0;
       }
     }
   #endif

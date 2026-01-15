@@ -248,15 +248,45 @@ int main(void) {
     }
   #endif
 
+  // Hoverboard PID Control Variables
+  float elapsedTime, time, timePrev;
+  float PIDL, errorL, previous_L_error = 0;  // Initialize previous_error to avoid garbage on first iteration
+  float PIDR, errorR, previous_R_error = 0;  // Initialize previous_error to avoid garbage on first iteration
+  float pid_L_p=0;
+  float pid_L_i=0;
+  float pid_L_d=0;
+  float pid_R_p=0;
+  float pid_R_i=0;
+  float pid_R_d=0;
+  float kp=30.0f;                         // Scale: 30 * 25° = 750 (reasonable motor command)
+  float ki=0.01f;                         // Very small - integral accumulation is dangerous
+  float kd=2.8f;                          // Moderate derivative damping
+  if (true) { // bula original PID
+    kp = 25.0f;
+    ki = 0;
+    kd = 0.8f;
+  }
+  float desired_angle = 0;                // TARGET ANGLE
+  int mspeedL = 0;
+  int mspeedR = 0;
+  int mspeed_filtered = 0;                // Rate-limited motor speed to smooth acceleration
+  const float MIN_ELAPSED_TIME = 0.001f;  // Prevent division by zero or extreme values (1 ms minimum)
+  const float DEADZONE = 3.0f;            // Deadzone: ignore errors smaller than ±3 degrees
+  const float MAX_INTEGRAL = 200.0f;      // Anti-windup: cap integral term
+  const int16_t MAX_ACCEL_RATE = 50;      // Max speed change per loop (50 units per DELAY_IN_MAIN_LOOP = ~0.5 units/ms)
+  // #define TEST_MODE           // Uncomment to test motor movement regardless of pitch angle
+
+  time = HAL_GetTick();
+
   while(1) {
     if (buzzerTimer - buzzerTimer_prev > 16*DELAY_IN_MAIN_LOOP) {   // 1 ms = 16 ticks buzzerTimer
 
     readCommand();                        // Read Command: input1[inIdx].cmd, input2[inIdx].cmd
     calcAvgSpeed();                       // Calculate average measured speed: speedAvg, speedAvgAbs
 
-    #ifndef VARIANT_TRANSPOTTER
+    #ifdef VARIANT_HOVERBOARD
       // ####### MOTOR ENABLING: Only if the initial input is very small (for SAFETY) #######
-      if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode && 
+      if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode &&
           ABS(input1[inIdx].cmd) < 50 && ABS(input2[inIdx].cmd) < 50){
         beepShort(6);                     // make 2 beeps indicating the motor enable
         beepShort(4); HAL_Delay(100);
@@ -267,100 +297,286 @@ int main(void) {
         #endif
       }
 
-      // ####### VARIANT_HOVERCAR #######
-      #if defined(VARIANT_HOVERCAR) || defined(VARIANT_SKATEBOARD) || defined(ELECTRIC_BRAKE_ENABLE)
-        uint16_t speedBlend;                                        // Calculate speed Blend, a number between [0, 1] in fixdt(0,16,15)
-        speedBlend = (uint16_t)(((CLAMP(speedAvgAbs,10,60) - 10) << 15) / 50); // speedBlend [0,1] is within [10 rpm, 60rpm]
-      #endif
-
-      #ifdef STANDSTILL_HOLD_ENABLE
-        standstillHold();                                           // Apply Standstill Hold functionality. Only available and makes sense for VOLTAGE or TORQUE Mode
-      #endif
-
-      #ifdef VARIANT_HOVERCAR
-      if (inIdx == CONTROL_ADC) {                                   // Only use use implementation below if pedals are in use (ADC input)
-        if (speedAvgAbs < 60) {                                     // Check if Hovercar is physically close to standstill to enable Double tap detection on Brake pedal for Reverse functionality
-          multipleTapDet(input1[inIdx].cmd, HAL_GetTick(), &MultipleTapBrake); // Brake pedal in this case is "input1" variable
-        }
-
-        if (input1[inIdx].cmd > 30) {                               // If Brake pedal (input1) is pressed, bring to 0 also the Throttle pedal (input2) to avoid "Double pedal" driving
-          input2[inIdx].cmd = (int16_t)((input2[inIdx].cmd * speedBlend) >> 15);
-          cruiseControl((uint8_t)rtP_Left.b_cruiseCtrlEna);         // Cruise control deactivated by Brake pedal if it was active
-        }
+      timePrev = time;
+      time = HAL_GetTick();
+      elapsedTime = (time - timePrev) / 1000.0f;
+      // Guard against zero or very small elapsed time to avoid extreme derivative values
+      if (elapsedTime < MIN_ELAPSED_TIME) {
+        elapsedTime = MIN_ELAPSED_TIME;
       }
-      #endif
 
-      #ifdef ELECTRIC_BRAKE_ENABLE
-        electricBrake(speedBlend, MultipleTapBrake.b_multipleTap);  // Apply Electric Brake. Only available and makes sense for TORQUE Mode
-      #endif
+      // SIDEBOARD_.PITCH IS THE PITCH ANGLE WHICH WE NEED
+      errorL = Sideboard_L.pitch - desired_angle; // ERROR CALCULATION
+      errorR = Sideboard_R.pitch - desired_angle; // ERROR CALCULATION
 
-      #ifdef VARIANT_HOVERCAR
-      if (inIdx == CONTROL_ADC) {                                   // Only use use implementation below if pedals are in use (ADC input)
-        if (speedAvg > 0) {                                         // Make sure the Brake pedal is opposite to the direction of motion AND it goes to 0 as we reach standstill (to avoid Reverse driving by Brake pedal) 
-          input1[inIdx].cmd = (int16_t)((-input1[inIdx].cmd * speedBlend) >> 15);
-        } else {
-          input1[inIdx].cmd = (int16_t)(( input1[inIdx].cmd * speedBlend) >> 15);
-        }
+      // Apply deadzone to prevent constant corrections on level surface
+      if (fabsf(errorL) < DEADZONE) {
+        errorL = 0;  // Treat small errors as zero
+        pid_L_i = 0;  // Reset integral when in deadzone
       }
+
+      // PROPORTIONAL ERROR
+      pid_L_p = kp * errorL;
+
+      // INTEGRAL ERROR with anti-windup (cap accumulation)
+      pid_L_i = pid_L_i + (ki * errorL * elapsedTime);         // Multiply by elapsedTime for proper integration
+      if (pid_L_i > MAX_INTEGRAL) pid_L_i = MAX_INTEGRAL;     // Anti-windup upper limit
+      if (pid_L_i < -MAX_INTEGRAL) pid_L_i = -MAX_INTEGRAL;   // Anti-windup lower limit
+
+      // DERIVATIVE ERROR (derivative damping only, not error rate)
+      pid_L_d = kd * (previous_L_error - errorL) / elapsedTime;  // Use previous_error for smoothing
+
+      // TOTAL PID VALUE
+      PIDL = pid_L_p + pid_L_i + pid_L_d;
+
+      // UPDATING THE ERROR VALUE
+      previous_L_error = errorL;
+
+      // Apply deadzone to prevent constant corrections on level surface
+      if (fabsf(errorR) < DEADZONE) {
+        errorR = 0;  // Treat small errors as zero
+        pid_R_i = 0;  // Reset integral when in deadzone
+      }
+
+      // PROPORTIONAL ERROR
+      pid_R_p = kp * errorR;
+
+      // INTEGRAL ERROR with anti-windup (cap accumulation)
+      pid_R_i = pid_R_i + (ki * errorR * elapsedTime);         // Multiply by elapsedTime for proper integration
+      if (pid_R_i > MAX_INTEGRAL) pid_R_i = MAX_INTEGRAL;     // Anti-windup upper limit
+      if (pid_R_i < -MAX_INTEGRAL) pid_R_i = -MAX_INTEGRAL;   // Anti-windup lower limit
+
+      // DERIVATIVE ERROR (derivative damping only, not error rate)
+      pid_R_d = kd * (previous_R_error - errorR) / elapsedTime;  // Use previous_error for smoothing
+
+      // TOTAL PID VALUE
+      PIDR = pid_R_p + pid_R_i + pid_R_d;
+
+      // UPDATING THE ERROR VALUE
+      previous_R_error = errorR;
+
+      #ifdef TEST_MODE
+        mspeedL = 60;
+        mspeedR = 60;
+      #else
+        // Convert PID to motor speed (absolute value)
+        mspeedL = (int)fabsf(PIDL);
+        mspeedR = (int)fabsf(PIDR);
+
+        // Clamp to safe range [-1000, 1000]
+        if (mspeedL > 1000) mspeedL = 1000;
+        if (mspeedR > 1000) mspeedR = 1000;
       #endif
 
-      #ifdef VARIANT_SKATEBOARD
-        if (input2[inIdx].cmd < 0) {                                // When Throttle is negative, it acts as brake. This condition is to make sure it goes to 0 as we reach standstill (to avoid Reverse driving) 
-          if (speedAvg > 0) {                                       // Make sure the braking is opposite to the direction of motion
-            input2[inIdx].cmd  = (int16_t)(( input2[inIdx].cmd * speedBlend) >> 15);
+      // MOTOR CONTROL: Only move if sensor is pressed
+      if ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) {
+        if (Sideboard_L.pitch < -DEADZONE) {  // Tilted backward: move forward
+          rtP_Left.b_cruiseCtrlEna  = 0;
+          cmdL = mspeedL;
+        }
+        else if (Sideboard_L.pitch > DEADZONE) {  // Tilted forward: move backward
+          rtP_Left.b_cruiseCtrlEna  = 0;
+          cmdL = -mspeedL;
+        }
+        else {  // Level: stop motors
+          if (speedAvgAbs > 100) {  // Only brake if actually moving
+            cmdL = -20;  // Small negative command for regen braking
           } else {
-            input2[inIdx].cmd  = (int16_t)((-input2[inIdx].cmd * speedBlend) >> 15);
+            cmdL = 0;
+            standstillHoldL();
           }
         }
-      #endif
-
-      // ####### LOW-PASS FILTER #######
-      rateLimiter16(input1[inIdx].cmd, rate, &steerRateFixdt);
-      rateLimiter16(input2[inIdx].cmd, rate, &speedRateFixdt);
-      filtLowPass32(steerRateFixdt >> 4, FILTER, &steerFixdt);
-      filtLowPass32(speedRateFixdt >> 4, FILTER, &speedFixdt);
-      steer = (int16_t)(steerFixdt >> 16);  // convert fixed-point to integer
-      speed = (int16_t)(speedFixdt >> 16);  // convert fixed-point to integer
-
-      // ####### VARIANT_HOVERCAR #######
-      #ifdef VARIANT_HOVERCAR
-      if (inIdx == CONTROL_ADC) {               // Only use use implementation below if pedals are in use (ADC input)
-
-        #ifdef MULTI_MODE_DRIVE
-        if (speed >= max_speed) {
-          speed = max_speed;
-        }
-        #endif
-
-        if (!MultipleTapBrake.b_multipleTap) {  // Check driving direction
-          speed = steer + speed;                // Forward driving: in this case steer = Brake, speed = Throttle
-        } else {
-          speed = steer - speed;                // Reverse driving: in this case steer = Brake, speed = Throttle
-        }
-        steer = 0;                              // Do not apply steering to avoid side effects if STEER_COEFFICIENT is NOT 0
+      } else {
+        // No sensor pressed: stop motors
+        cmdL = 0;
+        mspeedL = 0;
+        standstillHoldL();
       }
-      #endif
 
-      #if defined(TANK_STEERING) && !defined(VARIANT_HOVERCAR) && !defined(VARIANT_SKATEBOARD) 
-        // Tank steering (no mixing)
-        cmdL = steer; 
-        cmdR = speed;
-      #else 
-        // ####### MIXER #######
-        mixerFcn(speed << 4, steer << 4, &cmdR, &cmdL);   // This function implements the equations above
-      #endif
+      // MOTOR CONTROL: Only move if sensor is pressed
+      if ((Sideboard_R.sensors & 0x01) || (Sideboard_R.sensors & 0x02) >> 1) {
+        if (Sideboard_R.pitch < -DEADZONE) {  // Tilted backward: move forward
+          rtP_Right.b_cruiseCtrlEna = 0;
+          cmdR = mspeedR;
+        }
+        else if (Sideboard_R.pitch > DEADZONE) {  // Tilted forward: move backward
+          rtP_Right.b_cruiseCtrlEna = 0;
+          cmdR = -mspeedR;
+        }
+        else {  // Level: stop motors
+          if (speedAvgAbs > 100) {  // Only brake if actually moving
+            cmdR = -20; // Small negative command for regen braking
+          } else {
+            cmdR = 0;
+            standstillHoldR();
+          }
+        }
+      } else {
+        // No sensor pressed: stop motors
+        cmdR = 0;
+        mspeedR = 0;
+        standstillHoldR();
+      }
 
+      // RATE LIMITER: Smooth acceleration instead of jerky speed jumps
+      // Apply rate limiting to smooth the motor command transitions
+      static int16_t cmdL_ratelimit = 0, cmdR_ratelimit = 0;
+      rateLimiter16(cmdL, MAX_ACCEL_RATE, &cmdL_ratelimit);
+      rateLimiter16(cmdR, MAX_ACCEL_RATE, &cmdR_ratelimit);
+
+      // Use rate-limited commands for motor control
+      mspeed_filtered = (cmdL_ratelimit >> 4) > 0 ? (cmdL_ratelimit >> 4) : (-(cmdL_ratelimit >> 4));
 
       // ####### SET OUTPUTS (if the target change is less than +/- 100) #######
       #ifdef INVERT_R_DIRECTION
-        pwmr = cmdR;
+        pwmr = cmdR_ratelimit >> 4;
       #else
-        pwmr = -cmdR;
+        pwmr = -(cmdR_ratelimit >> 4);
       #endif
       #ifdef INVERT_L_DIRECTION
-        pwml = -cmdL;
+        pwml = -(cmdL_ratelimit >> 4);
       #else
-        pwml = cmdL;
+        pwml = (cmdL_ratelimit >> 4);
+      #endif
+
+      #ifdef TEST_MODE
+        if (main_loop_counter % 100 == 0) {
+          // DEBUG: Check if sideboard data is being received
+          printf("SIDEBOARD_L DEBUG: pitch=%d, dPitch=%d, cmd1=%d, cmd2=%d, sensors=%u, start=0x%04x, checksum=0x%04x\r\n",
+            Sideboard_L.pitch, Sideboard_L.dPitch, Sideboard_L.cmd1, Sideboard_L.cmd2, Sideboard_L.sensors,
+            Sideboard_L.start, Sideboard_L.checksum);
+          // Debug: Hoverboard Calculation Output (uncomment if needed)
+          printf("Hoverboard DEBUG: main pitch: %d, deadzone: %d, error: %d, PID_total: %d, mspeed: %d, enable: %d, speedAvgAbs: %d, sensor_activated: %d, cmdL:%i, cmdR:%i, cmdLRateLimited: %.4f, cmdRRateLimited: %.4f, BatADC:%i, BatV:%i, TempADC:%i, Temp:%i \r\n",
+            Sideboard_R.pitch,
+            (int)DEADZONE,
+            (int)errorR,
+            (int)PIDR,
+            mspeedL,
+            enable,
+            speedAvgAbs,
+            ((Sideboard_R.sensors & 0x01) || (Sideboard_R.sensors & 0x02) >> 1) ? 1 : 0,
+            cmdL,                     // 3: output command: [-1000, 1000]
+            cmdR,                     // 4: output command: [-1000, 1000]
+            cmdL_ratelimit,
+            cmdR_ratelimit,
+            adc_buffer.batt1,         // 5: for battery voltage calibration
+            batVoltageCalib,          // 6: for verifying battery voltage calibration
+            board_temp_adcFilt,       // 7: for board temperature calibration
+            board_temp_deg_c);        // 8: for verifying board temperature calibration;
+        }
+      #endif
+
+    #endif
+
+    #ifndef VARIANT_TRANSPOTTER
+      #ifndef VARIANT_HOVERBOARD
+        // ####### MOTOR ENABLING: Only if the initial input is very small (for SAFETY) #######
+        if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode &&
+            ABS(input1[inIdx].cmd) < 50 && ABS(input2[inIdx].cmd) < 50){
+          beepShort(6);                     // make 2 beeps indicating the motor enable
+          beepShort(4); HAL_Delay(100);
+          steerFixdt = speedFixdt = 0;      // reset filters
+          enable = 1;                       // enable motors
+          #if defined(DEBUG_SERIAL_USART2) || defined(DEBUG_SERIAL_USART3)
+          printf("-- Motors enabled --\r\n");
+          #endif
+        }
+
+        // ####### VARIANT_HOVERCAR #######
+        #if defined(VARIANT_HOVERCAR) || defined(VARIANT_SKATEBOARD) || defined(ELECTRIC_BRAKE_ENABLE)
+          uint16_t speedBlend;                                        // Calculate speed Blend, a number between [0, 1] in fixdt(0,16,15)
+          speedBlend = (uint16_t)(((CLAMP(speedAvgAbs,10,60) - 10) << 15) / 50); // speedBlend [0,1] is within [10 rpm, 60rpm]
+        #endif
+
+        #ifdef STANDSTILL_HOLD_ENABLE
+          standstillHold();                                           // Apply Standstill Hold functionality. Only available and makes sense for VOLTAGE or TORQUE Mode
+        #endif
+
+        #ifdef VARIANT_HOVERCAR
+        if (inIdx == CONTROL_ADC) {                                   // Only use use implementation below if pedals are in use (ADC input)
+          if (speedAvgAbs < 60) {                                     // Check if Hovercar is physically close to standstill to enable Double tap detection on Brake pedal for Reverse functionality
+            multipleTapDet(input1[inIdx].cmd, HAL_GetTick(), &MultipleTapBrake); // Brake pedal in this case is "input1" variable
+          }
+
+          if (input1[inIdx].cmd > 30) {                               // If Brake pedal (input1) is pressed, bring to 0 also the Throttle pedal (input2) to avoid "Double pedal" driving
+            input2[inIdx].cmd = (int16_t)((input2[inIdx].cmd * speedBlend) >> 15);
+            cruiseControl((uint8_t)rtP_Left.b_cruiseCtrlEna);         // Cruise control deactivated by Brake pedal if it was active
+          }
+        }
+        #endif
+
+        #ifdef ELECTRIC_BRAKE_ENABLE
+          electricBrake(speedBlend, MultipleTapBrake.b_multipleTap);  // Apply Electric Brake. Only available and makes sense for TORQUE Mode
+        #endif
+
+        #ifdef VARIANT_HOVERCAR
+        if (inIdx == CONTROL_ADC) {                                   // Only use use implementation below if pedals are in use (ADC input)
+          if (speedAvg > 0) {                                         // Make sure the Brake pedal is opposite to the direction of motion AND it goes to 0 as we reach standstill (to avoid Reverse driving by Brake pedal)
+            input1[inIdx].cmd = (int16_t)((-input1[inIdx].cmd * speedBlend) >> 15);
+          } else {
+            input1[inIdx].cmd = (int16_t)(( input1[inIdx].cmd * speedBlend) >> 15);
+          }
+        }
+        #endif
+
+        #ifdef VARIANT_SKATEBOARD
+          if (input2[inIdx].cmd < 0) {                                // When Throttle is negative, it acts as brake. This condition is to make sure it goes to 0 as we reach standstill (to avoid Reverse driving)
+            if (speedAvg > 0) {                                       // Make sure the braking is opposite to the direction of motion
+              input2[inIdx].cmd  = (int16_t)(( input2[inIdx].cmd * speedBlend) >> 15);
+            } else {
+              input2[inIdx].cmd  = (int16_t)((-input2[inIdx].cmd * speedBlend) >> 15);
+            }
+          }
+        #endif
+
+        // ####### LOW-PASS FILTER #######
+        rateLimiter16(input1[inIdx].cmd, rate, &steerRateFixdt);
+        rateLimiter16(input2[inIdx].cmd, rate, &speedRateFixdt);
+        filtLowPass32(steerRateFixdt >> 4, FILTER, &steerFixdt);
+        filtLowPass32(speedRateFixdt >> 4, FILTER, &speedFixdt);
+        steer = (int16_t)(steerFixdt >> 16);  // convert fixed-point to integer
+        speed = (int16_t)(speedFixdt >> 16);  // convert fixed-point to integer
+
+        // ####### VARIANT_HOVERCAR #######
+        #ifdef VARIANT_HOVERCAR
+        if (inIdx == CONTROL_ADC) {               // Only use use implementation below if pedals are in use (ADC input)
+
+          #ifdef MULTI_MODE_DRIVE
+          if (speed >= max_speed) {
+            speed = max_speed;
+          }
+          #endif
+
+          if (!MultipleTapBrake.b_multipleTap) {  // Check driving direction
+            speed = steer + speed;                // Forward driving: in this case steer = Brake, speed = Throttle
+          } else {
+            speed = steer - speed;                // Reverse driving: in this case steer = Brake, speed = Throttle
+          }
+          steer = 0;                              // Do not apply steering to avoid side effects if STEER_COEFFICIENT is NOT 0
+        }
+        #endif
+
+        #if defined(TANK_STEERING) && !defined(VARIANT_HOVERCAR) && !defined(VARIANT_SKATEBOARD)
+          // Tank steering (no mixing)
+          cmdL = steer;
+          cmdR = speed;
+        #else
+          // ####### MIXER #######
+          mixerFcn(speed << 4, steer << 4, &cmdR, &cmdL);   // This function implements the equations above
+        #endif
+
+
+        // ####### SET OUTPUTS (if the target change is less than +/- 100) #######
+        #ifdef INVERT_R_DIRECTION
+          pwmr = cmdR;
+        #else
+          pwmr = -cmdR;
+        #endif
+        #ifdef INVERT_L_DIRECTION
+          pwml = -cmdL;
+        #else
+          pwml = cmdL;
+        #endif
       #endif
     #endif
 
