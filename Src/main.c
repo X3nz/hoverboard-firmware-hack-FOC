@@ -255,22 +255,22 @@ int main(void) {
   float pid_p=0;
   float pid_i=0;
   float pid_d=0;
-  float kp=30.0f;                         // Scale: 30 * 25° = 750 (reasonable motor command)
-  float ki=0.01f;                         // Very small - integral accumulation is dangerous
-  float kd=2.8f;                          // Moderate derivative damping
+  float kp=30.0f;                         // Scale: 30 * 25° = 750 (reasonable motor command). P-Term (Proportional): Controls "Stiffness". Higher = harder to tilt, snaps back faster. Too high = violent shaking. Lower = soft/mushy feel.
+  float ki=0.01f;                         // Very small - integral accumulation is dangerous. I-Term (Integral): Controls "Drift Correction". Helps hold the angle against steady weight/hills. Too high = wobbles/overshoots.
+  float kd=2.8f;                          // Moderate derivative damping. D-Term (Derivative): Controls "Shock Absorption". Higher = smoother, resists sudden changes. Too high = vibration/noise.
   if (true) { // bula original PID
-    kp = 25.0f;
-    ki = 0;
-    kd = 0.8f;
+    kp = 25.0f;                           // Overrides 'kp' above. Change THIS value to tune stiffness.
+    ki = 0;                               // Overrides 'ki' above. Set to 0 means no drift correction (pure balancing).
+    kd = 0.8f;                            // Overrides 'kd' above. Change THIS value to tune damping/smoothness.
   }
-  float desired_angle = 0;                // TARGET ANGLE
+  float desired_angle = 5;                // TARGET ANGLE. The angle the board tries to maintain. Change this (e.g. to 2.0) to tilt the nose up or down by default.
   int mspeed = 0;
   int mspeed_filtered = 0;                // Rate-limited motor speed to smooth acceleration
   const float MIN_ELAPSED_TIME = 0.001f;  // Prevent division by zero or extreme values (1 ms minimum)
-  const float DEADZONE = 3.0f;            // Deadzone: ignore errors smaller than ±3 degrees
-  const float MAX_INTEGRAL = 200.0f;      // Anti-windup: cap integral term
-  const int16_t MAX_ACCEL_RATE = 50;      // Max speed change per loop (50 units per DELAY_IN_MAIN_LOOP = ~0.5 units/ms)
-  // #define ONEWHEEL_TEST_MODE           // Uncomment to test motor movement regardless of pitch angle
+  const float DEADZONE = 7.0f;            // Deadzone: ignore errors smaller than ±7 degrees. The "Slack" or "Play" at the center. Lower = tighter engagement. Higher = board must tilt more before moving.
+  const float MAX_INTEGRAL = 200.0f;      // Anti-windup: cap integral term. Limits how much "force" builds up over time if you hold it tilted. Prevents runaway acceleration.
+  const int16_t MAX_ACCEL_RATE = 4;      // Max speed change per loop (50 units per DELAY_IN_MAIN_LOOP = ~0.5 units/ms). Acceleration Ramp. Lower = smoother/slower acceleration. Higher = instant torque/snappier.
+  #define TEST_MODE           // Uncomment to test motor movement regardless of pitch angle
 
   time = HAL_GetTick();
 
@@ -289,9 +289,14 @@ int main(void) {
         elapsedTime = MIN_ELAPSED_TIME;
       }
 
+      // Safety: Disable motors if serial communication is lost
+      if (timeoutFlgSerial) {
+        enable = 0;
+      }
+
       // Enable motors if currently disabled and no error condition exists
-      if (enable == 0 && !rtY_Left.z_errCode && !rtY_Right.z_errCode &&
-          ABS(input1[inIdx].cmd) < 50 && ABS(input2[inIdx].cmd) < 50) {
+      if (enable == 0 && !timeoutFlgSerial && !rtY_Left.z_errCode && !rtY_Right.z_errCode &&
+          ((Sideboard_L.sensors & 0x01) || ((Sideboard_L.sensors & 0x02) >> 1))) {
         beepShort(6);                     // make 2 beeps indicating the motor enable
         beepShort(4); HAL_Delay(100);
         steerFixdt = speedFixdt = 0;      // reset filters
@@ -301,86 +306,88 @@ int main(void) {
         #endif
       }
 
+      // Determine orientation and target angle
+      float effective_angle = desired_angle;
+      if (abs(Sideboard_L.pitch) > 90) {
+        effective_angle = 180.0f + desired_angle;
+      }
+
       // SIDEBOARD_L.PITCH IS THE PITCH ANGLE WHICH WE NEED
-      error = Sideboard_L.pitch - desired_angle; // ERROR CALCULATION
+      error = Sideboard_L.pitch - effective_angle; // ERROR CALCULATION. Difference between where the board IS and where it SHOULD be.
+      if (error > 180.0f) error -= 360.0f;
+      if (error < -180.0f) error += 360.0f;
 
       // Apply deadzone to prevent constant corrections on level surface
       if (fabsf(error) < DEADZONE) {
-        error = 0;  // Treat small errors as zero
-        pid_i = 0;  // Reset integral when in deadzone
+        error = 0;  // Treat small errors as zero. If within the deadzone, the motor does nothing.
+        pid_i = 0;  // Reset integral when in deadzone. Clears accumulated error history so it doesn't jerk when you exit the deadzone.
       }
 
       // PROPORTIONAL ERROR
-      pid_p = kp * error;
+      pid_p = kp * error; // Immediate correction force based on how far you are currently tilted.
 
       // INTEGRAL ERROR with anti-windup (cap accumulation)
-      pid_i = pid_i + (ki * error * elapsedTime);         // Multiply by elapsedTime for proper integration
-      if (pid_i > MAX_INTEGRAL) pid_i = MAX_INTEGRAL;     // Anti-windup upper limit
-      if (pid_i < -MAX_INTEGRAL) pid_i = -MAX_INTEGRAL;   // Anti-windup lower limit
+      pid_i = pid_i + (ki * error * elapsedTime);         // Multiply by elapsedTime for proper integration. Accumulates error over time (e.g. pushing against a hill).
+      if (pid_i > MAX_INTEGRAL) pid_i = MAX_INTEGRAL;     // Anti-windup upper limit. Prevents the board from accumulating infinite speed request if stuck.
+      if (pid_i < -MAX_INTEGRAL) pid_i = -MAX_INTEGRAL;   // Anti-windup lower limit.
 
       // DERIVATIVE ERROR (derivative damping only, not error rate)
-      pid_d = kd * (previous_error - error) / elapsedTime;  // Use previous_error for smoothing
+      pid_d = kd * (previous_error - error) / elapsedTime;  // Use previous_error for smoothing. Reacts to the SPEED of the tilt. Resists rapid changes to stabilize wobbles.
 
       // TOTAL PID VALUE
-      PID = pid_p + pid_i + pid_d;
+      PID = pid_p + pid_i + pid_d; // Sum of all 3 terms to get the final motor power request.
 
       // UPDATING THE ERROR VALUE
-      previous_error = error;
+      previous_error = error; // Save current error to compare against in the next loop (for Derivative).
 
-      #ifdef ONEWHEEL_TEST_MODE
-        mspeed = 60;
-      #else
-        // Convert PID to motor speed (absolute value)
-        mspeed = abs((int)fabsf(PID));
+      // Convert PID to motor speed (absolute value)
+      mspeed = abs((int)fabsf(PID)); // Convert to positive number (0 to 1000) for magnitude.
 
-        // Clamp to safe range [-1000, 1000]
-        if (mspeed > 1000) mspeed = 1000;
-
-        // Minimum speed for movement only if error is significant
-        // if (mspeed < 50) mspeed = 50;
-      #endif
+      // Clamp to safe range [-1000, 1000]
+      if (mspeed > 1000) mspeed = 1000; // Hard limit on motor power.
 
       // MOTOR CONTROL: Only move if sensor is pressed
-      if ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) {
-        if (Sideboard_L.pitch < -DEADZONE) {  // Tilted backward: move forward
-          rtP_Left.b_cruiseCtrlEna  = 0;
-          rtP_Right.b_cruiseCtrlEna = 0;
-          cmdL = mspeed;
-          cmdR = mspeed;
-        }
-        else if (Sideboard_L.pitch > DEADZONE) {  // Tilted forward: move backward
-          rtP_Left.b_cruiseCtrlEna  = 0;
-          rtP_Right.b_cruiseCtrlEna = 0;
-          cmdL = -mspeed;
-          cmdR = -mspeed;
-        }
-        else {  // Level: stop motors
-          if (speedAvgAbs > 100) {  // Only brake if actually moving
-            cmdL = -20;  // Small negative command for regen braking
-            cmdR = -20;
+      uint8_t drive_active = !timeoutFlgSerial && ((Sideboard_L.sensors & 0x01) || ((Sideboard_L.sensors & 0x02) >> 1));
+
+      if (drive_active && error < -DEADZONE) {  // move forward (upside down). Logic for forward movement based on pitch angle.
+        rtP_Left.b_cruiseCtrlEna  = 0;
+        rtP_Right.b_cruiseCtrlEna = 0;
+        cmdL = mspeed; // Apply calculated speed to Left Motor.
+        cmdR = mspeed; // Apply calculated speed to Right Motor.
+      } else if (drive_active && error > DEADZONE) {  // move backward (upside down). Logic for backward movement.
+        rtP_Left.b_cruiseCtrlEna  = 0;
+        rtP_Right.b_cruiseCtrlEna = 0;
+        cmdL = -mspeed; // Reverse speed.
+        cmdR = -mspeed; // Reverse speed.
+      } else {
+        // Level or Sensors Inactive: stop motors.
+        if (speedAvgAbs > 100) {  // Only brake if actually moving. Regenerative braking logic.
+          // Apply opposing force: negative if moving forward, positive if moving backward
+          cmdL = (speedAvg > 0) ? -20 : 20;
+          cmdR = cmdL;
+        } else {
+          cmdL = 0;
+          cmdR = 0;
+          mspeed = 0;
+          if (drive_active) {
+            standstillHold(); // Engage position holding if enabled and sensors active.
           } else {
-            cmdL = 0;
-            cmdR = 0;
-            standstillHold();
+            enable = 0;       // Disable motors if sensors are inactive.
+            rtP_Left.b_cruiseCtrlEna  = 0;
+            rtP_Right.b_cruiseCtrlEna = 0;
           }
         }
-      } else {
-        // No sensor pressed: stop motors
-        cmdL = 0;
-        cmdR = 0;
-        mspeed = 0;
-        standstillHold();
       }
 
-      if(Sideboard_L.pitch > 45)
+      if(error > 30) // Safety angle limit (nose dive/tail drag).
         standstillHold();
-      if(Sideboard_L.pitch < -45)
+      if(error < -40) // Safety angle limit.
         standstillHold();
 
       // RATE LIMITER: Smooth acceleration instead of jerky speed jumps
       // Apply rate limiting to smooth the motor command transitions
       static int16_t cmdL_ratelimit = 0, cmdR_ratelimit = 0;
-      rateLimiter16(cmdL, MAX_ACCEL_RATE, &cmdL_ratelimit);
+      rateLimiter16(cmdL, MAX_ACCEL_RATE, &cmdL_ratelimit); // Limits how fast cmdL can change. MAX_ACCEL_RATE controls the ramp.
       rateLimiter16(cmdR, MAX_ACCEL_RATE, &cmdR_ratelimit);
 
       // Use rate-limited commands for motor control
@@ -388,7 +395,7 @@ int main(void) {
 
       // ####### SET OUTPUTS (if the target change is less than +/- 100) #######
       #ifdef INVERT_R_DIRECTION
-        pwmr = cmdR_ratelimit >> 4;
+        pwmr = cmdR_ratelimit >> 4; // Bit shift >> 4 divides by 16 (fixed point conversion).
       #else
         pwmr = -(cmdR_ratelimit >> 4);
       #endif
@@ -398,30 +405,32 @@ int main(void) {
         pwml = (cmdL_ratelimit >> 4);
       #endif
 
-      if (main_loop_counter % 100 == 0) {
-        // DEBUG: Check if sideboard data is being received
-        printf("SIDEBOARD_L DEBUG: pitch=%d, dPitch=%d, cmd1=%d, cmd2=%d, sensors=%u, start=0x%04x, checksum=0x%04x\r\n",
-               Sideboard_L.pitch, Sideboard_L.dPitch, Sideboard_L.cmd1, Sideboard_L.cmd2, Sideboard_L.sensors,
-               Sideboard_L.start, Sideboard_L.checksum);
-        // Debug: Hoverboard Calculation Output (uncomment if needed)
-        printf("Hoverboard DEBUG: main pitch: %d, deadzone: %d, error: %d, PID_total: %d, mspeed: %d, enable: %d, speedAvgAbs: %d, sensor_activated: %d, cmdL:%i, cmdR:%i, cmdLRateLimited: %.4f, cmdRRateLimited: %.4f, BatADC:%i, BatV:%i, TempADC:%i, Temp:%i \r\n",
-              Sideboard_L.pitch,
-              (int)DEADZONE,
-              (int)error,
-              (int)PID,
-              mspeed,
-              enable,
-              speedAvgAbs,
-              ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) ? 1 : 0,
-              cmdL,                     // 3: output command: [-1000, 1000]
-              cmdR,                     // 4: output command: [-1000, 1000]
-              (float)cmdL_ratelimit / 16.0f,
-              (float)cmdR_ratelimit / 16.0f,
-              adc_buffer.batt1,         // 5: for battery voltage calibration
-              batVoltageCalib,          // 6: for verifying battery voltage calibration
-              board_temp_adcFilt,       // 7: for board temperature calibration
-              board_temp_deg_c);        // 8: for verifying board temperature calibration;
-      }
+      #ifdef TEST_MODE
+        if (main_loop_counter % 100 == 0) {
+          // DEBUG: Check if sideboard data is being received
+          printf("SIDEBOARD_L DEBUG: pitch=%d, dPitch=%d, cmd1=%d, cmd2=%d, sensors=%u, start=0x%04x, checksum=0x%04x\r\n",
+                Sideboard_L.pitch, Sideboard_L.dPitch, Sideboard_L.cmd1, Sideboard_L.cmd2, Sideboard_L.sensors,
+                Sideboard_L.start, Sideboard_L.checksum);
+          // Debug: Hoverboard Calculation Output (uncomment if needed)
+          printf("Hoverboard DEBUG: main pitch: %d, deadzone: %d, error: %d, PID_total: %d, mspeed: %d, enable: %d, speedAvgAbs: %d, sensor_activated: %d, cmdL:%i, cmdR:%i, cmdLRateLimited: %.4f, cmdRRateLimited: %.4f, BatADC:%i, BatV:%i, TempADC:%i, Temp:%i \r\n",
+                Sideboard_L.pitch,
+                (int)DEADZONE,
+                (int)error,
+                (int)PID,
+                mspeed,
+                enable,
+                speedAvgAbs,
+                ((Sideboard_L.sensors & 0x01) || (Sideboard_L.sensors & 0x02) >> 1) ? 1 : 0,
+                cmdL,                     // 3: output command: [-1000, 1000]
+                cmdR,                     // 4: output command: [-1000, 1000]
+                (float)cmdL_ratelimit / 16.0f,
+                (float)cmdR_ratelimit / 16.0f,
+                adc_buffer.batt1,         // 5: for battery voltage calibration
+                batVoltageCalib,          // 6: for verifying battery voltage calibration
+                board_temp_adcFilt,       // 7: for board temperature calibration
+                board_temp_deg_c);        // 8: for verifying board temperature calibration;
+        }
+      #endif
     #endif
 
     #ifndef VARIANT_TRANSPOTTER
